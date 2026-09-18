@@ -33,21 +33,23 @@ export class JevClient implements JevAsker {
       state,
       questions,
     );
-    let status: number;
-    let ok: boolean;
-    let text: string;
+    let response: Response;
     try {
-      const response = await this.fetcher(request.url, {
+      response = await this.fetcher(request.url, {
         method: request.method,
         headers: request.headers,
         body: request.body,
       });
-      status = response.status;
-      ok = response.ok;
-      text = await response.text();
     } catch (error) {
       throw new JevTransportError(error);
     }
-    return parseJevResponse(status, ok, text);
+    let text = '';
+    try {
+      text = await response.text();
+    } catch (error) {
+      // A body that cannot be read on a failed status is still that status's fault.
+      if (response.ok) throw new JevTransportError(error);
+    }
+    return parseJevResponse(response.status, response.ok, text);
   }
 }

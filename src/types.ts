@@ -117,7 +117,10 @@ export interface CompactOptions {
    * What to do with a batch that still fails after its retries. `throw` (the
    * default) rejects the whole compaction, so the caller can fall back; `keep`
    * leaves every call of that batch untouched (keep call and result), applies
-   * the other batches' answers and counts it in `stats.failedBatches`.
+   * the other batches' answers and counts it in `stats.failedBatches`. `keep`
+   * covers a transient failure that outlived its retries and a missing or
+   * malformed answer; a 4xx other than 429, an abort or an unrecognised error
+   * is the request's fault and throws in both modes.
    */
   onBatchFailure?: 'throw' | 'keep';
   /**
@@ -158,9 +161,13 @@ export interface CompactResult {
     /** Which fitting stage the state needed, '' when no request was made. */
     stateStage: string;
     requests: number;
-    /** Retries spent across all requests. */
+    /** Retries spent across all requests, including by batches that then failed. */
     retries: number;
-    /** Batches that failed after their retries and were kept whole (`onBatchFailure: 'keep'`). */
+    /**
+     * Batches kept whole under `onBatchFailure: 'keep'`: a transient failure
+     * that outlived its retries, or a response with a missing or malformed
+     * answer (a batch is all-or-nothing; one bad answer fails the batch).
+     */
     failedBatches: number;
     ms: number;
   };

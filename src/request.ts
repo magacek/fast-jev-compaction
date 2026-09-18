@@ -63,13 +63,27 @@ export class JevTransportError extends Error {
     this.name = 'JevTransportError';
     this.cause = cause;
   }
+  /**
+   * False for an abort (the caller gave up) and for a URL that cannot be
+   * parsed (a configuration error); true for everything else the transport
+   * throws, which is taken to be the network.
+   */
+  get retryable(): boolean {
+    const cause = this.cause as { name?: unknown; code?: unknown; message?: unknown } | null;
+    if (!cause || typeof cause !== 'object') return true;
+    if (cause.name === 'AbortError' || cause.code === 'ERR_INVALID_URL') return false;
+    return !/invalid url|failed to parse url/i.test(String(cause.message ?? ''));
+  }
 }
 
 /** A 2xx answer whose body is not a Jev response; never retried. */
 export class JevResponseError extends Error {
-  constructor(message: string) {
+  /** The question names whose answers were missing or malformed, when known. */
+  readonly names: readonly string[];
+  constructor(message: string, names: readonly string[] = []) {
     super(message);
     this.name = 'JevResponseError';
+    this.names = names;
   }
 }
 
@@ -110,7 +124,7 @@ export function noulAnswer(
     typeof answer.noul !== 'number' ||
     !Number.isFinite(answer.noul)
   ) {
-    throw new JevResponseError(`Invalid Jev answer for ${name}`);
+    throw new JevResponseError(`Invalid Jev answer for ${name}`, [name]);
   }
   return answer.noul;
 }

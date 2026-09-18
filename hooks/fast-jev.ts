@@ -80,6 +80,8 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
     'maxStateTokens',
     'maxRequestTokens',
     'truncateHeadChars',
+    'retries',
+    'retryDelayMs',
   ] as const) {
     const value = options[key];
     if (typeof value === 'number' && Number.isFinite(value)) numbers[key] = value;
@@ -230,6 +232,17 @@ export function summarize(result: CompactResult): string {
 
 const UI_LOG_MAX_CHARS = 4096;
 
+/** Whether the dispatch was abandoned (Esc, a hook above settled, budget out). */
+function isAborted(next: { signal?: AbortSignal }): boolean {
+  return next.signal?.aborted === true;
+}
+
+/** An interrupted compaction is vetoed quietly: no summary, nothing replaced. */
+function skipped($: { ui: { log: (text: string) => void } }): { skip: string } {
+  $.ui.log('compaction interrupted; nothing changed');
+  return { skip: 'fast-jev-compaction: interrupted' };
+}
+
 export function decisionLog(result: CompactResult): string {
   return result.decisions
     .filter((d) => d.reason !== 'pinned')
@@ -315,8 +328,12 @@ export const register: Register = (on: On, options: PluginOptions) => {
 
   on('session.compact', async ($, event, next) => {
     const quiet = event.trigger === 'precompute';
+    const interrupted = () => isAborted(next);
     try {
       const config = { ...configured, apiKey: await getApiKey($, configured) };
+      if (!/^https:\/\//i.test(config.baseUrl)) {
+        $.ui.log(`baseUrl ${config.baseUrl} is not https; the key travels in cleartext`);
+      }
       const { result, messages } = await compactSession(
         event.messages,
         config,
@@ -326,6 +343,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
         },
         (ms) => $.clock.sleep(ms, { signal: next.signal }),
       );
+      if (interrupted()) return skipped($);
       for (const line of decisionLogLines(result)) $.ui.log(line);
       if (reductionRatio(result) < config.minReductionRatio) {
         notify(
@@ -342,6 +360,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
       );
       return { messages };
     } catch (error) {
+      if (interrupted()) return skipped($);
       notify(
         $,
         `fallback to built-in summary (${error instanceof Error ? error.message : String(error)})`,

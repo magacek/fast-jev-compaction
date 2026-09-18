@@ -13,7 +13,7 @@
     "apiKeyEnv": {
       "type": "string",
       "title": "API key environment variable",
-      "description": "Environment variable (or settings.env key) that holds the Jev API key when apiKey is unset.",
+      "description": "Key under `env` in settings.json that holds the Jev API key when apiKey is unset. The process environment is read for TYPESAFE_API_KEY only.",
       "default": "TYPESAFE_API_KEY"
     },
     "keepThreshold": {
@@ -57,6 +57,18 @@
       "title": "Truncated tool result head",
       "description": "Characters of a tool result kept when Jev decides its full output is no longer needed; 0 keeps only the note.",
       "default": 300
+    },
+    "retries": {
+      "type": "number",
+      "title": "Retries per request",
+      "description": "Further attempts for one Jev request after a 429, a 5xx or a failed fetch.",
+      "default": 2
+    },
+    "retryDelayMs": {
+      "type": "number",
+      "title": "Retry delay (ms)",
+      "description": "Wait before the first retry, tripled on each further one.",
+      "default": 500
     },
     "model": {
       "type": "string",

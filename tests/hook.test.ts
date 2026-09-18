@@ -56,6 +56,7 @@ function jevFetch(answer: (name: string) => number, bodies: string[] = [], urls:
 
 describe('hook config', () => {
   it('reads userConfig values and falls back to defaults', () => {
+    expect(resolveHookConfig({ retries: 1, retryDelayMs: 0 })).toMatchObject({ retries: 1, retryDelayMs: 0 });
     expect(resolveHookConfig({})).toEqual({
       onBatchFailure: 'throw',
       compactAtPercent: 60,
@@ -278,6 +279,62 @@ describe('register', () => {
     expect(outPre.messages).toHaveLength(3);
     expect(pre.toasts).toEqual([]);
     expect(pre.logs.some((l) => l.startsWith('kept 3/7 messages'))).toBe(true);
+  });
+
+  it('waits through $.clock.sleep bound to the dispatch signal, and vetoes an interrupted compaction', async () => {
+    const hooks = registered({ preserveRecentMessages: 1, minReductionRatio: 0 });
+    let fetches = 0;
+    const flaky = async (url: string, init?: { body?: string }) => {
+      fetches++;
+      if (fetches === 1) return { status: 503, ok: false, text: 'down' };
+      return jevFetch(() => 0.1)(url, init);
+    };
+    const e = engine(flaky);
+    const sleeps: Array<{ ms: number; signal: unknown }> = [];
+    const controller = new AbortController();
+    const $ = { ...e.$, clock: { sleep: async (ms: number, o?: { signal?: AbortSignal }) => { sleeps.push({ ms, signal: o?.signal }); } } };
+    const next = Object.assign(async () => ({ messages: [] }), { signal: controller.signal });
+    (register as any)((event: string, hook: Hook) => { hooks[event] = hook; }, { apiKey: 'k', preserveRecentMessages: 1, minReductionRatio: 0, retries: 1, retryDelayMs: 7 });
+    const out = (await hooks['session.compact']!($, { trigger: 'manual', messages: transcript() }, next)) as { messages: unknown[] };
+    expect(out.messages).toHaveLength(3);
+    expect(fetches).toBe(2);
+    expect(sleeps).toEqual([{ ms: 7, signal: controller.signal }]);
+
+    // the same hook, interrupted while it waits: no toast, no fallback, a skip
+    const aborted = new AbortController();
+    let nexts = 0;
+    const nextAborted = Object.assign(async () => { nexts++; return { messages: [] }; }, { signal: aborted.signal });
+    fetches = 0;
+    const e2 = engine(flaky);
+    const $2 = { ...e2.$, clock: { sleep: async () => { aborted.abort(); throw Object.assign(new Error('aborted'), { name: 'AbortError' }); } } };
+    const out2 = await hooks['session.compact']!($2, { trigger: 'manual', messages: transcript() }, nextAborted);
+    expect(out2).toEqual({ skip: 'fast-jev-compaction: interrupted' });
+    expect(nexts).toBe(0);
+    expect(e2.toasts).toEqual([]);
+  });
+
+  it('a precompute stays quiet on the fallback paths too', async () => {
+    const hooks = registered({ preserveRecentMessages: 1, minReductionRatio: 1 });
+    const next = async () => ({ messages: [] });
+    const below = engine(jevFetch(() => 0.1));
+    await hooks['session.compact']!(below.$, { trigger: 'precompute', messages: transcript() }, next);
+    expect(below.toasts).toEqual([]);
+    expect(below.logs.some((l) => l.startsWith('fallback to built-in summary (below'))).toBe(true);
+    const failing = engine(async () => ({ status: 401, ok: false, text: 'nope' }));
+    await hooks['session.compact']!(failing.$, { trigger: 'precompute', messages: transcript() }, next);
+    expect(failing.toasts).toEqual([]);
+    expect(failing.logs.some((l) => l.includes('(401)'))).toBe(true);
+  });
+
+  it('logs a warning when baseUrl is not https', async () => {
+    const hooks = registered({ preserveRecentMessages: 1, baseUrl: 'http://gateway.internal/v1/systemone' });
+    const e = engine(jevFetch(() => 0.1));
+    await hooks['session.compact']!(e.$, { trigger: 'manual', messages: transcript() }, async () => ({ messages: [] }));
+    expect(e.logs.some((l) => l.includes('is not https'))).toBe(true);
+    const https = engine(jevFetch(() => 0.1));
+    (register as any)((event: string, hook: Hook) => { hooks[event] = hook; }, { apiKey: 'k', preserveRecentMessages: 1 });
+    await hooks['session.compact']!(https.$, { trigger: 'manual', messages: transcript() }, async () => ({ messages: [] }));
+    expect(https.logs.some((l) => l.includes('is not https'))).toBe(false);
   });
 
   it('does not request compaction from a subagent turn', async () => {

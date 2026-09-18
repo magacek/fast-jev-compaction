@@ -1,4 +1,4 @@
-import { JevRequestError, JevTransportError, noulAnswer } from './request.js';
+import { JevRequestError, JevResponseError, JevTransportError, noulAnswer } from './request.js';
 import { collectToolCalls, estimateTokens, fitState } from './state.js';
 import type {
   CallAnswer,
@@ -133,57 +133,92 @@ export function decideCall(
 
 /**
  * A failure worth another attempt: a 429/5xx, or the transport failing before
- * a status came back. A missing key, a malformed body, an abort, or any other
- * error is not.
+ * a status came back (not an abort, not an unparsable URL). A missing key, a
+ * malformed body, any other 4xx, or an unrecognised error is not.
  */
 function transient(error: unknown): boolean {
   if (error instanceof JevRequestError) return error.retryable;
-  return error instanceof JevTransportError;
+  if (error instanceof JevTransportError) return error.retryable;
+  return false;
 }
 
-/**
- * One request with its retries. Resolves with the answers and the retries it
- * spent; rejects with the last error once the retries are used up.
- */
+/** What `onBatchFailure: 'keep'` may keep: a hiccup that outlived its retries, or a bad answer. */
+function keepable(error: unknown): boolean {
+  return transient(error) || error instanceof JevResponseError;
+}
+
+type Asked =
+  | { ok: true; answers: Record<string, JevAnswer>; retries: number }
+  | { ok: false; error: unknown; retries: number };
+
+/** One request with its retries; never throws, the retries spent are reported either way. */
 async function askWithRetries(
   asker: JevAsker,
   state: CompactionState,
   questions: JevQuestions,
   options: Pick<ResolvedCompactOptions, 'retries' | 'retryDelayMs' | 'sleep'>,
-): Promise<{ answers: Record<string, JevAnswer>; retries: number }> {
+): Promise<Asked> {
   let delay = options.retryDelayMs;
   for (let attempt = 0; ; attempt++) {
     try {
       const { answers } = await asker.ask(state, questions);
-      return { answers, retries: attempt };
+      return { ok: true, answers, retries: attempt };
     } catch (error) {
-      if (attempt >= options.retries || !transient(error)) throw error;
-      await options.sleep(delay);
+      if (attempt >= options.retries || !transient(error)) return { ok: false, error, retries: attempt };
+      try {
+        await options.sleep(delay);
+      } catch (interrupted) {
+        return { ok: false, error: interrupted, retries: attempt };
+      }
       delay *= 3;
     }
   }
 }
 
+type Batched =
+  | { ok: true; answers: Map<string, CallAnswer>; retries: number }
+  | { ok: false; error: unknown; retries: number };
+
+/**
+ * One batch: its questions asked, its answers read. A batch is all-or-nothing:
+ * one missing or malformed answer fails the whole batch with the names listed.
+ */
 async function askBatch(
   asker: JevAsker,
   state: CompactionState,
   batch: readonly ToolCall[],
   options: Pick<ResolvedCompactOptions, 'retries' | 'retryDelayMs' | 'sleep'>,
-): Promise<{ answers: Map<string, CallAnswer>; retries: number }> {
+): Promise<Batched> {
   const questions: JevQuestions = Object.assign({}, ...batch.map(questionsFor));
-  const { answers, retries } = await askWithRetries(asker, state, questions, options);
-  return {
-    retries,
-    answers: new Map(
-      batch.map((call) => [
-        call.id,
-        {
-          keepCall: noulAnswer(answers, `call_${call.id}`),
-          keepResult: noulAnswer(answers, `result_${call.id}`),
-        },
-      ]),
-    ),
-  };
+  const asked = await askWithRetries(asker, state, questions, options);
+  if (!asked.ok) return asked;
+  const answers = new Map<string, CallAnswer>();
+  const invalid: string[] = [];
+  for (const call of batch) {
+    const pair: Partial<CallAnswer> = {};
+    for (const [field, name] of [
+      ['keepCall', `call_${call.id}`],
+      ['keepResult', `result_${call.id}`],
+    ] as const) {
+      try {
+        pair[field] = noulAnswer(asked.answers, name);
+      } catch (error) {
+        if (!(error instanceof JevResponseError)) throw error;
+        invalid.push(name);
+      }
+    }
+    if (pair.keepCall !== undefined && pair.keepResult !== undefined) {
+      answers.set(call.id, { keepCall: pair.keepCall, keepResult: pair.keepResult });
+    }
+  }
+  if (invalid.length > 0) {
+    return {
+      ok: false,
+      retries: asked.retries,
+      error: new JevResponseError(`Invalid Jev answer for ${invalid.join(', ')}`, invalid),
+    };
+  }
+  return { ok: true, answers, retries: asked.retries };
 }
 
 function truncatedResultText(text: string, isError: boolean, headChars: number): string {
@@ -328,20 +363,26 @@ export async function compact(
     const state = fitState(messages, calls, resolved);
     fitted = state;
     batches = batchCalls(candidates, state.tokens, resolved);
-    // Every batch runs to completion before any failure is acted on, so the
-    // answers already paid for are not thrown away by a sibling's rejection.
-    const settled = await Promise.allSettled(
+    // Every batch runs to completion before any failure is acted on (askBatch
+    // never rejects), so under `keep` the answers already paid for survive a
+    // sibling's failure. Under `throw` the compaction still fails as a whole.
+    const outcomes = await Promise.all(
       batches.map((batch) => askBatch(asker, state.state, batch, resolved)),
     );
-    for (const outcome of settled) {
-      if (outcome.status === 'fulfilled') {
-        retries += outcome.value.retries;
-        for (const [id, answer] of outcome.value.answers) answers.set(id, answer);
-      } else if (resolved.onBatchFailure === 'keep') {
+    const failures: unknown[] = [];
+    for (const outcome of outcomes) {
+      retries += outcome.retries;
+      if (outcome.ok) {
+        for (const [id, answer] of outcome.answers) answers.set(id, answer);
+      } else if (resolved.onBatchFailure === 'keep' && keepable(outcome.error)) {
         failedBatches++;
       } else {
-        throw outcome.reason;
+        failures.push(outcome.error);
       }
+    }
+    if (failures.length > 0) {
+      // The actionable error first: a bad key or a malformed body over a hiccup.
+      throw failures.find((error) => !transient(error)) ?? failures[0];
     }
   }
 

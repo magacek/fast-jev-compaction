@@ -55,6 +55,8 @@ The plugin declares these `userConfig` values in
 | `maxStateTokens` | `25000` |
 | `maxRequestTokens` | `30000` |
 | `truncateHeadChars` | `300` |
+| `retries` | `2` |
+| `retryDelayMs` | `500` |
 | `model` | `jev-latest` |
 | `onBatchFailure` | `throw` |
 | `baseUrl` | `https://api.typesafe.ai/v1/systemone` |
@@ -76,7 +78,11 @@ environment is consulted for `TYPESAFE_API_KEY` alone.
 `onBatchFailure` picks what happens when one request batch still fails after
 the library's retries: `throw` (default) falls back to the built-in summary,
 `keep` leaves that batch's tool calls untouched and applies the other batches'
-answers, so a single gateway hiccup does not cost the whole compaction.
+answers, so a single gateway hiccup (or one malformed answer) does not cost the
+whole compaction. A bad key, any other 4xx or an interrupted dispatch still
+falls back. An interrupted compaction (Esc) is vetoed quietly rather than
+reported as a gateway failure, and a `baseUrl` that is not `https://` is
+logged once per compaction because the key would travel in cleartext.
 
 Every option except `apiKey`, `apiKeyEnv`, `baseUrl`, `compactAtPercent`,
 `minReductionRatio` and `model` is passed straight to the library; see the root README for what they

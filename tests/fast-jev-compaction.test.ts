@@ -381,13 +381,15 @@ describe('compact', () => {
     expect(reductionRatio(output)).toBe(0);
   });
 
-  it('rejects malformed answers', async () => {
+  it('rejects malformed answers, naming every bad question, without a retry', async () => {
+    let asked = 0;
     const broken: JevAsker = {
-      ask: async () => ({ answers: { call_t1: { noul: 0.5 } } }),
+      ask: async () => { asked++; return { answers: { call_t1: { noul: 0.5 }, result_t1: { noul: 'x' } } }; },
     };
     await expect(compact(transcript(), broken, { preserveRecentMessages: 1 })).rejects.toThrow(
-      /Invalid Jev answer/,
+      /Invalid Jev answer for result_t1, call_t2, result_t2/,
     );
+    expect(asked).toBe(1);
   });
 });
 
@@ -476,12 +478,17 @@ describe('retries and batch failure', () => {
     expect(waits).toEqual([]);
   });
 
-  it('the HTTP client wraps a throwing fetch in JevTransportError', async () => {
+  it('the HTTP client wraps a throwing fetch in JevTransportError, but a failed status stays a request error', async () => {
     const client = new JevClient({
       apiKey: 'k',
       fetch: (async () => { throw new TypeError('fetch failed'); }) as typeof fetch,
     });
     await expect(client.ask('s', {})).rejects.toBeInstanceOf(JevTransportError);
+    const unreadable = new JevClient({
+      apiKey: 'k',
+      fetch: (async () => ({ status: 401, ok: false, text: async () => { throw new Error('socket closed'); } })) as unknown as typeof fetch,
+    });
+    await expect(unreadable.ask('s', {})).rejects.toMatchObject({ name: 'JevRequestError', status: 401 });
   });
 
   it('with onBatchFailure=keep, a dead batch is kept whole and the other batches still apply', async () => {
@@ -497,7 +504,7 @@ describe('retries and batch failure', () => {
     const output = await compact(messages, dead(), { ...batched, onBatchFailure: 'keep' });
     expect(output.stats.requests).toBeGreaterThan(1);
     expect(output.stats.failedBatches).toBe(1);
-    expect(output.stats.retries).toBe(0);
+    expect(output.stats.retries).toBe(1); // the dead batch's spent retry still counts
     const byId = new Map(output.decisions.map((d) => [d.id, d]));
     expect(byId.get('t1')).toMatchObject({ action: 'keep', keepCall: 1, keepResult: 1 });
     const others = output.decisions.filter((d) => d.id !== 't1' && d.reason !== 'pinned');
@@ -505,6 +512,92 @@ describe('retries and batch failure', () => {
     expect(others.every((d) => d.action === 'drop_call')).toBe(true);
     // the dead batch was attempted 1 + retries times; the live ones once
     expect(calls.filter((c) => c.includes('call_t1'))).toHaveLength(2);
+  });
+});
+
+describe('keep mode scope and error choice', () => {
+  const batched = (messages: Message[]) => ({
+    preserveRecentMessages: 1,
+    maxRequestTokens: fitState(messages, collectToolCalls(messages, 1), { ...fit, goal: '', preserveRecentMessages: 1 }).tokens + 150,
+    retries: 1,
+    retryDelayMs: 0,
+    onBatchFailure: 'keep' as const,
+  });
+  function failing(error: (names: string[]) => unknown): JevAsker {
+    return {
+      async ask(_s, questions: JevQuestions) {
+        const names = Object.keys(questions);
+        const e = error(names);
+        if (e) throw e;
+        return { answers: Object.fromEntries(names.map((n) => [n, { noul: 0.1 }])) };
+      },
+    };
+  }
+
+  it('keep still throws a 4xx other than 429: the request is at fault, not the gateway', async () => {
+    const messages = transcript();
+    await expect(
+      compact(messages, failing((n) => (n.includes('call_t1') ? new JevRequestError(401, 'invalid_api_key') : null)), batched(messages)),
+    ).rejects.toThrow(/\(401\)/);
+  });
+
+  it('keep still throws a plain error and an abort', async () => {
+    const messages = transcript();
+    await expect(
+      compact(messages, failing((n) => (n.includes('call_t1') ? new Error('boom') : null)), batched(messages)),
+    ).rejects.toThrow(/boom/);
+    const abort = Object.assign(new Error('The operation was aborted'), { name: 'AbortError' });
+    let asked = 0;
+    const aborting: JevAsker = { ask: async () => { asked++; throw new JevTransportError(abort); } };
+    await expect(
+      compact(messages, aborting, { preserveRecentMessages: 1, retries: 2, retryDelayMs: 0, onBatchFailure: 'keep' }),
+    ).rejects.toThrow(/aborted/);
+    expect(asked).toBe(1); // one batch, and an abort is never retried
+  });
+
+  it('keep keeps a malformed batch whole and applies the rest', async () => {
+    const messages = transcript();
+    const asker: JevAsker = {
+      async ask(_s, questions: JevQuestions) {
+        const names = Object.keys(questions);
+        return {
+          answers: Object.fromEntries(names.map((n) => [n, n === 'result_t1' ? { noul: 'bad' } : { noul: 0.1 }])),
+        };
+      },
+    };
+    const output = await compact(messages, asker, batched(messages));
+    expect(output.stats.failedBatches).toBe(1);
+    const t1 = output.decisions.find((d) => d.id === 't1');
+    expect(t1).toMatchObject({ action: 'keep', keepCall: 1, keepResult: 1 });
+    expect(output.decisions.filter((d) => d.id !== 't1' && d.reason !== 'pinned').every((d) => d.action === 'drop_call')).toBe(true);
+  });
+
+  it('throw mode surfaces the actionable error over a hiccup when several batches fail', async () => {
+    const messages = transcript();
+    const asker = failing((n) => (n.includes('call_t1') ? new JevRequestError(503, 'down') : new JevRequestError(402, 'insufficient_quota')));
+    await expect(compact(messages, asker, { ...batched(messages), onBatchFailure: 'throw' })).rejects.toThrow(/\(402\)/);
+  });
+
+  it('a transport error from an unparsable URL is not retried', async () => {
+    let asked = 0;
+    const bad = { ask: async () => { asked++; throw new JevTransportError(Object.assign(new TypeError('Invalid URL'), { code: 'ERR_INVALID_URL' })); } };
+    await expect(compact(transcript(), bad, { preserveRecentMessages: 1, retryDelayMs: 0 })).rejects.toThrow(/Invalid URL/);
+    expect(asked).toBe(1);
+  });
+
+  it('uses a real timer when no sleep is injected', async () => {
+    let asked = 0;
+    const asker: JevAsker = {
+      async ask(_s, questions: JevQuestions) {
+        asked++;
+        if (asked === 1) throw new JevRequestError(503, 'down');
+        return { answers: Object.fromEntries(Object.keys(questions).map((n) => [n, { noul: 0.9 }])) };
+      },
+    };
+    const started = Date.now();
+    const output = await compact(transcript(), asker, { preserveRecentMessages: 1, retries: 1, retryDelayMs: 25 });
+    expect(Date.now() - started).toBeGreaterThanOrEqual(20);
+    expect(output.stats.retries).toBe(1);
   });
 });
 
