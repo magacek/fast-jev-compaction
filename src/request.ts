@@ -75,7 +75,9 @@ function abortedByCaller(cause: Thrown): boolean {
 
 /** The URL itself is wrong: a configuration error, not the network. */
 function unparsableUrl(cause: Thrown): boolean {
-  return cause.code === 'ERR_INVALID_URL' || /invalid url|failed to parse url/i.test(String(cause.message ?? ''));
+  const invalidUrlCode = cause.code === 'ERR_INVALID_URL';
+  const invalidUrlMessage = /invalid url|failed to parse url/i.test(String(cause.message ?? ''));
+  return invalidUrlCode || invalidUrlMessage;
 }
 
 /**
@@ -120,21 +122,21 @@ export function parseJevResponse(
   } catch {
     throw new JevResponseError('Jev returned malformed JSON');
   }
-  if (
-    parsed === null ||
-    typeof parsed !== 'object' ||
-    !('answers' in parsed) ||
-    parsed.answers === null ||
-    typeof parsed.answers !== 'object'
-  ) {
-    throw new JevResponseError('Jev response is missing answers');
-  }
-  return parsed as JevResponse;
+  if (!hasAnswers(parsed)) throw new JevResponseError('Jev response is missing answers');
+  return parsed;
+}
+
+/** Whether a parsed body is an object carrying an `answers` object. */
+function hasAnswers(parsed: unknown): parsed is JevResponse {
+  const isObject = (value: unknown): value is Record<string, unknown> =>
+    value !== null && typeof value === 'object';
+  return isObject(parsed) && isObject(parsed['answers']);
 }
 
 /** Whether `answer` carries a finite `noul` probability. */
 export function hasNoul(answer: JevAnswer | undefined): answer is NoulAnswer {
-  return answer !== undefined && 'noul' in answer && Number.isFinite(answer.noul);
+  const noul = answer && 'noul' in answer ? answer.noul : undefined;
+  return Number.isFinite(noul);
 }
 
 /** The `noul` probability of one answer; throws when it is not there. */

@@ -34,8 +34,10 @@ const REQUEST_OVERHEAD_TOKENS = 20;
 /** A timer where the host has one; no wait at all where it does not. */
 function defaultSleep(ms: number): Promise<void> {
   const host = globalThis as { setTimeout?: (fn: () => void, ms: number) => unknown };
-  if (ms <= 0 || typeof host.setTimeout !== 'function') return Promise.resolve();
   const timer = host.setTimeout;
+  const nothingToWait = ms <= 0;
+  const noTimer = typeof timer !== 'function';
+  if (nothingToWait || noTimer) return Promise.resolve();
   return new Promise((resolve) => timer(resolve, ms));
 }
 
@@ -163,7 +165,8 @@ async function askWithRetries(
       return { ok: true, answers, retries: attempt };
     } catch (error) {
       const exhausted = attempt >= options.retries;
-      if (exhausted || !transient(error)) return { ok: false, error, retries: attempt };
+      const giveUp = exhausted || !transient(error);
+      if (giveUp) return { ok: false, error, retries: attempt };
       try {
         await options.sleep(delay);
       } catch (interrupted) {
@@ -255,7 +258,8 @@ async function askBatches(
     else failures.push(outcome.error);
   }
   if (failures.length > 0) {
-    throw failures.find((error) => !transient(error)) ?? failures[0];
+    const actionable = failures.find((error) => !transient(error));
+    throw actionable ?? failures[0];
   }
   return { answers, retries, failedBatches };
 }
@@ -402,36 +406,48 @@ export async function compact(
     batches = batchCalls(candidates, state.tokens, resolved);
     asked = await askBatches(asker, state.state, batches, resolved);
   }
-  const { answers, retries, failedBatches } = asked;
-
   const decisions = calls.map((call) =>
-    decideCall(call, answers.get(call.id) ?? { keepCall: 1, keepResult: 1 }, resolved),
+    decideCall(call, asked.answers.get(call.id) ?? { keepCall: 1, keepResult: 1 }, resolved),
   );
-  const kept = applyDecisions(
-    messages,
-    decisions,
-    calls,
-    resolved.truncateHeadChars,
-  );
+  const kept = applyDecisions(messages, decisions, calls, resolved.truncateHeadChars);
   return {
     messages: kept,
     decisions,
     stats: {
-      messagesBefore: messages.length,
-      messagesAfter: kept.length,
-      charsBefore,
-      charsAfter: kept.reduce((sum, message) => sum + messageChars(message), 0),
-      calls: calls.length,
-      kept: count(decisions, 'kept'),
-      resultsDropped: count(decisions, 'result_dropped'),
-      callsDropped: count(decisions, 'call_dropped'),
-      pinned: count(decisions, 'pinned'),
+      ...countMessages(messages, kept, charsBefore),
+      ...countDecisions(calls, decisions),
       stateTokens: fitted.tokens,
       stateStage: fitted.stage,
       requests: batches.length,
-      retries,
-      failedBatches,
+      retries: asked.retries,
+      failedBatches: asked.failedBatches,
       ms: Date.now() - started,
     },
+  };
+}
+
+function countMessages(
+  before: readonly Message[],
+  after: readonly Message[],
+  charsBefore: number,
+): Pick<CompactResult['stats'], 'messagesBefore' | 'messagesAfter' | 'charsBefore' | 'charsAfter'> {
+  return {
+    messagesBefore: before.length,
+    messagesAfter: after.length,
+    charsBefore,
+    charsAfter: after.reduce((sum, message) => sum + messageChars(message), 0),
+  };
+}
+
+function countDecisions(
+  calls: readonly ToolCall[],
+  decisions: readonly CallDecision[],
+): Pick<CompactResult['stats'], 'calls' | 'kept' | 'resultsDropped' | 'callsDropped' | 'pinned'> {
+  return {
+    calls: calls.length,
+    kept: count(decisions, 'kept'),
+    resultsDropped: count(decisions, 'result_dropped'),
+    callsDropped: count(decisions, 'call_dropped'),
+    pinned: count(decisions, 'pinned'),
   };
 }
