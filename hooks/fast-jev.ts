@@ -9,7 +9,13 @@ import type {
 } from 'claude-code';
 
 import { compact, reductionRatio, resolveOptions } from '../src/compact.js';
-import { buildJevRequest, DEFAULT_MODEL, parseJevResponse, SYSTEM_ONE_URL } from '../src/request.js';
+import {
+  buildJevRequest,
+  DEFAULT_MODEL,
+  JevTransportError,
+  parseJevResponse,
+  SYSTEM_ONE_URL,
+} from '../src/request.js';
 import type {
   CompactOptions,
   CompactResult,
@@ -80,6 +86,7 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
   }
   const config: HookConfig = {
     ...numbers,
+    onBatchFailure: options['onBatchFailure'] === 'keep' ? 'keep' : 'throw',
     compactAtPercent: optionNumber(options, 'compactAtPercent', HOOK_DEFAULTS.compactAtPercent),
     minReductionRatio: optionNumber(
       options,
@@ -107,11 +114,16 @@ export function jevAsker(
   return {
     async ask(state, questions) {
       const request = buildJevRequest({ apiKey, model, baseUrl }, state, questions);
-      const response = await fetchFn(request.url, {
-        method: request.method,
-        headers: request.headers,
-        body: request.body,
-      });
+      let response: HookFetchResponse;
+      try {
+        response = await fetchFn(request.url, {
+          method: request.method,
+          headers: request.headers,
+          body: request.body,
+        });
+      } catch (error) {
+        throw new JevTransportError(error);
+      }
       return parseJevResponse(response.status, response.ok, response.text);
     },
   };
@@ -181,12 +193,13 @@ export async function compactSession(
   messages: readonly SessionMessage[],
   config: HookConfig,
   fetchFn: HookFetch,
+  sleep?: (ms: number) => Promise<void>,
 ): Promise<SessionCompaction> {
   if (!config.apiKey) throw new Error(`${config.apiKeyEnv} is not configured`);
   const result = await compact(
     messages,
     jevAsker(fetchFn, config.apiKey, config.model, config.baseUrl),
-    config,
+    sleep ? { ...config, sleep } : config,
   );
   return { result, messages: toSessionMessages(messages, result.messages) };
 }
@@ -203,9 +216,16 @@ export function summarize(result: CompactResult): string {
     stats.callsDropped > 0 ? `${stats.callsDropped} call_dropped` : '',
     stats.pinned > 0 ? `${stats.pinned} pinned` : '',
   ].filter(Boolean);
+  const requests = [
+    `${stats.requests} request(s)`,
+    stats.retries > 0 ? `${stats.retries} retried` : '',
+    stats.failedBatches > 0 ? `${stats.failedBatches} batch(es) failed and kept whole` : '',
+  ]
+    .filter(Boolean)
+    .join(', ');
   return `${percent(reductionRatio(result))} reduction; ${
     parts.join(', ') || 'no tool calls'
-  }; state ~${stats.stateTokens} tokens (${stats.stateStage}) in ${stats.requests} request(s)`;
+  }; state ~${stats.stateTokens} tokens (${stats.stateStage}) in ${requests}`;
 }
 
 const UI_LOG_MAX_CHARS = 4096;
@@ -297,10 +317,15 @@ export const register: Register = (on: On, options: PluginOptions) => {
     const quiet = event.trigger === 'precompute';
     try {
       const config = { ...configured, apiKey: await getApiKey($, configured) };
-      const { result, messages } = await compactSession(event.messages, config, async (url, init) => {
-        const response = await $.http.fetch(url, init);
-        return { status: response.status, ok: response.ok, text: response.text };
-      });
+      const { result, messages } = await compactSession(
+        event.messages,
+        config,
+        async (url, init) => {
+          const response = await $.http.fetch(url, init);
+          return { status: response.status, ok: response.ok, text: response.text };
+        },
+        (ms) => $.clock.sleep(ms, { signal: next.signal }),
+      );
       for (const line of decisionLogLines(result)) $.ui.log(line);
       if (reductionRatio(result) < config.minReductionRatio) {
         notify(

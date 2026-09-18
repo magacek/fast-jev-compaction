@@ -53,8 +53,13 @@ built-in compaction summary with the original messages.
    removed, untouched messages are returned as the same objects, and no result
    is ever left without its call.
 
-Jev failures, malformed answers, a missing key, or a history that cannot be
-fitted throw; the caller (or the Claude Code hook) decides what to fall back to.
+A 429, a 5xx or a failed fetch (`JevTransportError`) is retried (`retries` times, with backoff);
+every batch runs to completion before any failure is acted on, so one bad
+request never discards the answers of the others. A batch that still fails
+throws by default, or with `onBatchFailure: 'keep'` leaves its calls whole and
+is counted in `stats.failedBatches`. Malformed answers, a missing key, a 4xx
+other than 429, or a history that cannot be fitted throw; the caller (or the
+Claude Code hook) decides what to fall back to.
 
 ## Install and usage
 
@@ -110,6 +115,10 @@ put it in a source file.
 | `maxStateTokens` | `25000` | Estimated token ceiling for the state |
 | `maxRequestTokens` | `30000` | Estimated ceiling for state plus one batch of questions |
 | `truncateHeadChars` | `300` | Characters of a dropped tool result retained before its note |
+| `retries` | `2` | Further attempts per request after a 429, a 5xx or a `JevTransportError` (a throwing fetch); nothing else is retried |
+| `retryDelayMs` | `500` | Wait before the first retry, tripled on each further one |
+| `onBatchFailure` | `throw` | `throw` rejects the compaction when a batch fails after its retries; `keep` leaves that batch's calls whole and applies the rest |
+| `sleep` | `setTimeout` | Injectable wait between retries, for hosts without a timer |
 
 `result.stats` reports message and character counts before and after, the
 per-reason decision counts, the state size in estimated tokens, which fitting

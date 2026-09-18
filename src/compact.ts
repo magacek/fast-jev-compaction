@@ -1,4 +1,4 @@
-import { noulAnswer } from './request.js';
+import { JevRequestError, JevTransportError, noulAnswer } from './request.js';
 import { collectToolCalls, estimateTokens, fitState } from './state.js';
 import type {
   CallAnswer,
@@ -6,6 +6,7 @@ import type {
   CompactOptions,
   CompactResult,
   CompactionState,
+  JevAnswer,
   JevAsker,
   JevQuestions,
   Message,
@@ -21,10 +22,22 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
   maxStateTokens: 25_000,
   maxRequestTokens: 30_000,
   truncateHeadChars: 300,
+  retries: 2,
+  retryDelayMs: 500,
+  onBatchFailure: 'throw',
+  sleep: defaultSleep,
 };
 
 /** Tokens the request envelope (`model`, key names) adds around state and questions. */
 const REQUEST_OVERHEAD_TOKENS = 20;
+
+/** A timer where the host has one; no wait at all where it does not. */
+function defaultSleep(ms: number): Promise<void> {
+  const host = globalThis as { setTimeout?: (fn: () => void, ms: number) => unknown };
+  if (ms <= 0 || typeof host.setTimeout !== 'function') return Promise.resolve();
+  const timer = host.setTimeout;
+  return new Promise((resolve) => timer(resolve, ms));
+}
 
 function finite(value: number | undefined, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
@@ -49,6 +62,10 @@ export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOpt
       0,
       Math.floor(finite(options.truncateHeadChars, DEFAULT_OPTIONS.truncateHeadChars)),
     ),
+    retries: Math.max(0, Math.floor(finite(options.retries, DEFAULT_OPTIONS.retries))),
+    retryDelayMs: Math.max(0, finite(options.retryDelayMs, DEFAULT_OPTIONS.retryDelayMs)),
+    onBatchFailure: options.onBatchFailure === 'keep' ? 'keep' : DEFAULT_OPTIONS.onBatchFailure,
+    sleep: options.sleep ?? DEFAULT_OPTIONS.sleep,
   };
 }
 
@@ -114,22 +131,59 @@ export function decideCall(
   return { ...base, action: 'drop_call', reason: 'call_dropped' };
 }
 
+/**
+ * A failure worth another attempt: a 429/5xx, or the transport failing before
+ * a status came back. A missing key, a malformed body, an abort, or any other
+ * error is not.
+ */
+function transient(error: unknown): boolean {
+  if (error instanceof JevRequestError) return error.retryable;
+  return error instanceof JevTransportError;
+}
+
+/**
+ * One request with its retries. Resolves with the answers and the retries it
+ * spent; rejects with the last error once the retries are used up.
+ */
+async function askWithRetries(
+  asker: JevAsker,
+  state: CompactionState,
+  questions: JevQuestions,
+  options: Pick<ResolvedCompactOptions, 'retries' | 'retryDelayMs' | 'sleep'>,
+): Promise<{ answers: Record<string, JevAnswer>; retries: number }> {
+  let delay = options.retryDelayMs;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const { answers } = await asker.ask(state, questions);
+      return { answers, retries: attempt };
+    } catch (error) {
+      if (attempt >= options.retries || !transient(error)) throw error;
+      await options.sleep(delay);
+      delay *= 3;
+    }
+  }
+}
+
 async function askBatch(
   asker: JevAsker,
   state: CompactionState,
   batch: readonly ToolCall[],
-): Promise<Map<string, CallAnswer>> {
+  options: Pick<ResolvedCompactOptions, 'retries' | 'retryDelayMs' | 'sleep'>,
+): Promise<{ answers: Map<string, CallAnswer>; retries: number }> {
   const questions: JevQuestions = Object.assign({}, ...batch.map(questionsFor));
-  const { answers } = await asker.ask(state, questions);
-  return new Map(
-    batch.map((call) => [
-      call.id,
-      {
-        keepCall: noulAnswer(answers, `call_${call.id}`),
-        keepResult: noulAnswer(answers, `result_${call.id}`),
-      },
-    ]),
-  );
+  const { answers, retries } = await askWithRetries(asker, state, questions, options);
+  return {
+    retries,
+    answers: new Map(
+      batch.map((call) => [
+        call.id,
+        {
+          keepCall: noulAnswer(answers, `call_${call.id}`),
+          keepResult: noulAnswer(answers, `result_${call.id}`),
+        },
+      ]),
+    ),
+  };
 }
 
 function truncatedResultText(text: string, isError: boolean, headChars: number): string {
@@ -268,14 +322,27 @@ export async function compact(
   let fitted: { tokens: number; stage: string } = { tokens: 0, stage: '' };
   let batches: ToolCall[][] = [];
   const answers = new Map<string, CallAnswer>();
+  let retries = 0;
+  let failedBatches = 0;
   if (candidates.length > 0) {
     const state = fitState(messages, calls, resolved);
     fitted = state;
     batches = batchCalls(candidates, state.tokens, resolved);
-    const answered = await Promise.all(
-      batches.map((batch) => askBatch(asker, state.state, batch)),
+    // Every batch runs to completion before any failure is acted on, so the
+    // answers already paid for are not thrown away by a sibling's rejection.
+    const settled = await Promise.allSettled(
+      batches.map((batch) => askBatch(asker, state.state, batch, resolved)),
     );
-    for (const map of answered) for (const [id, answer] of map) answers.set(id, answer);
+    for (const outcome of settled) {
+      if (outcome.status === 'fulfilled') {
+        retries += outcome.value.retries;
+        for (const [id, answer] of outcome.value.answers) answers.set(id, answer);
+      } else if (resolved.onBatchFailure === 'keep') {
+        failedBatches++;
+      } else {
+        throw outcome.reason;
+      }
+    }
   }
 
   const decisions = calls.map((call) =>
@@ -303,6 +370,8 @@ export async function compact(
       stateTokens: fitted.tokens,
       stateStage: fitted.stage,
       requests: batches.length,
+      retries,
+      failedBatches,
       ms: Date.now() - started,
     },
   };

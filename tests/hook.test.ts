@@ -57,6 +57,7 @@ function jevFetch(answer: (name: string) => number, bodies: string[] = [], urls:
 describe('hook config', () => {
   it('reads userConfig values and falls back to defaults', () => {
     expect(resolveHookConfig({})).toEqual({
+      onBatchFailure: 'throw',
       compactAtPercent: 60,
       minReductionRatio: 0.25,
       model: 'jev-latest',
@@ -73,9 +74,11 @@ describe('hook config', () => {
         compactAtPercent: 'no',
         baseUrl: 'https://gateway.example/v1/systemone',
         apiKeyEnv: 'GATEWAY_KEY',
+        onBatchFailure: 'keep',
       }),
     ).toEqual({
       apiKey: 'k',
+      onBatchFailure: 'keep',
       keepThreshold: 0.3,
       maxStateTokens: 1000,
       model: 'jev-x',
@@ -211,6 +214,15 @@ describe('compactSession', () => {
     expect(JSON.parse(bodies[0]!).model).toBe('typesafe/jev-latest');
   });
 
+  it('retries a throwing engine fetch, then gives up', async () => {
+    let calls = 0;
+    const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k', retries: 1, retryDelayMs: 0 };
+    await expect(
+      compactSession(transcript(), config, async () => { calls++; throw new Error('ECONNRESET'); }),
+    ).rejects.toThrow(/Jev transport failed: ECONNRESET/);
+    expect(calls).toBe(2);
+  });
+
   it('throws on a missing key and on failed requests so the hook falls back', async () => {
     const config = resolveHookConfig({ preserveRecentMessages: 1 });
     await expect(compactSession(transcript(), config, jevFetch(() => 0))).rejects.toThrow(/TYPESAFE_API_KEY/);
@@ -218,7 +230,7 @@ describe('compactSession', () => {
       compactSession(transcript(), resolveHookConfig({ preserveRecentMessages: 1, apiKeyEnv: 'GATEWAY_KEY' }), jevFetch(() => 0)),
     ).rejects.toThrow(/GATEWAY_KEY is not configured/);
     await expect(
-      compactSession(transcript(), { ...config, apiKey: 'k' }, async () => ({ status: 500, ok: false, text: 'x' })),
+      compactSession(transcript(), { ...config, apiKey: 'k', retryDelayMs: 0 }, async () => ({ status: 500, ok: false, text: 'x' })),
     ).rejects.toThrow(/500/);
   });
 });

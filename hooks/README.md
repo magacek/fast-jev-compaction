@@ -56,6 +56,7 @@ The plugin declares these `userConfig` values in
 | `maxRequestTokens` | `30000` |
 | `truncateHeadChars` | `300` |
 | `model` | `jev-latest` |
+| `onBatchFailure` | `throw` |
 | `baseUrl` | `https://api.typesafe.ai/v1/systemone` |
 | `apiKeyEnv` | `TYPESAFE_API_KEY` |
 
@@ -71,6 +72,11 @@ key, either the `apiKey` option or `apiKeyEnv` naming the variable that holds
 it. The host lists a module's environment reads statically, so a custom
 `apiKeyEnv` is read from `env` in the user's settings only; the process
 environment is consulted for `TYPESAFE_API_KEY` alone.
+
+`onBatchFailure` picks what happens when one request batch still fails after
+the library's retries: `throw` (default) falls back to the built-in summary,
+`keep` leaves that batch's tool calls untouched and applies the other batches'
+answers, so a single gateway hiccup does not cost the whole compaction.
 
 Every option except `apiKey`, `apiKeyEnv`, `baseUrl`, `compactAtPercent`,
 `minReductionRatio` and `model` is passed straight to the library; see the root README for what they

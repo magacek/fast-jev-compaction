@@ -35,20 +35,56 @@ export function buildJevRequest(
   };
 }
 
+/** A non-2xx answer from the endpoint; `status` decides whether a retry makes sense. */
+export class JevRequestError extends Error {
+  readonly status: number;
+  readonly body: string;
+  constructor(status: number, body: string) {
+    super(`Jev request failed (${status}): ${body.slice(0, 200)}`);
+    this.name = 'JevRequestError';
+    this.status = status;
+    this.body = body;
+  }
+  /** 429 and 5xx are transient by contract; anything else is the request's fault. */
+  get retryable(): boolean {
+    return this.status === 429 || this.status >= 500;
+  }
+}
+
+/**
+ * The transport failed before any status came back (DNS, TLS, a dropped
+ * connection); retried like a 5xx. The built-in transports wrap a throwing
+ * fetch in one; a custom `JevAsker` throws it to opt a failure into retries.
+ */
+export class JevTransportError extends Error {
+  readonly cause: unknown;
+  constructor(cause: unknown) {
+    super(`Jev transport failed: ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = 'JevTransportError';
+    this.cause = cause;
+  }
+}
+
+/** A 2xx answer whose body is not a Jev response; never retried. */
+export class JevResponseError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'JevResponseError';
+  }
+}
+
 /** Validates a Jev response body; throws on anything but an `answers` object. */
 export function parseJevResponse(
   status: number,
   ok: boolean,
   text: string,
 ): JevResponse {
-  if (!ok) {
-    throw new Error(`Jev request failed (${status}): ${text.slice(0, 200)}`);
-  }
+  if (!ok) throw new JevRequestError(status, text);
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch {
-    throw new Error('Jev returned malformed JSON');
+    throw new JevResponseError('Jev returned malformed JSON');
   }
   if (
     parsed === null ||
@@ -57,7 +93,7 @@ export function parseJevResponse(
     parsed.answers === null ||
     typeof parsed.answers !== 'object'
   ) {
-    throw new Error('Jev response is missing answers');
+    throw new JevResponseError('Jev response is missing answers');
   }
   return parsed as JevResponse;
 }
@@ -74,7 +110,7 @@ export function noulAnswer(
     typeof answer.noul !== 'number' ||
     !Number.isFinite(answer.noul)
   ) {
-    throw new Error(`Invalid Jev answer for ${name}`);
+    throw new JevResponseError(`Invalid Jev answer for ${name}`);
   }
   return answer.noul;
 }

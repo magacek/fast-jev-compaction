@@ -15,6 +15,8 @@ import {
   resolveOptions,
   type HistoryToolCall,
   type JevAsker,
+  JevRequestError,
+  JevTransportError,
   type JevQuestions,
   type Message,
   type ToolCall,
@@ -386,6 +388,123 @@ describe('compact', () => {
     await expect(compact(transcript(), broken, { preserveRecentMessages: 1 })).rejects.toThrow(
       /Invalid Jev answer/,
     );
+  });
+});
+
+describe('retries and batch failure', () => {
+  function flaky(failures: Map<string, number[]>, statuses: number[], calls: string[] = []): JevAsker {
+    // fails a batch (identified by the question names it carries) with the next status in `statuses`
+    return {
+      async ask(_state, questions: JevQuestions) {
+        const names = Object.keys(questions);
+        calls.push(names.join(','));
+        for (const [marker, left] of failures) {
+          if (names.includes(marker) && left.length > 0) {
+            const status = left.shift()!;
+            throw new JevRequestError(status, `status ${status}`);
+          }
+        }
+        return {
+          answers: Object.fromEntries(names.map((n) => [n, { type: 'noul' as const, noul: 0.1 }])),
+        };
+      },
+    };
+  }
+  const noWait = { retryDelayMs: 0 };
+
+  it('retries a transient failure with backoff and reports it', async () => {
+    const waits: number[] = [];
+    const calls: string[] = [];
+    const output = await compact(
+      transcript(),
+      flaky(new Map([['call_t1', [503]]]), [], calls),
+      { preserveRecentMessages: 1, retryDelayMs: 500, sleep: async (ms) => { waits.push(ms); } },
+    );
+    expect(calls).toHaveLength(2);
+    expect(waits).toEqual([500]);
+    expect(output.stats).toMatchObject({ requests: 1, retries: 1, failedBatches: 0 });
+    expect(output.decisions.every((d) => d.action === 'drop_call')).toBe(true);
+  });
+
+  it('gives up after the retries with tripled waits', async () => {
+    const waits: number[] = [];
+    const calls: string[] = [];
+    await expect(
+      compact(transcript(), flaky(new Map([['call_t1', [503, 502, 429, 500]]]), [], calls), {
+        preserveRecentMessages: 1,
+        retries: 2,
+        retryDelayMs: 100,
+        sleep: async (ms) => { waits.push(ms); },
+      }),
+    ).rejects.toThrow(/Jev request failed \(429\)/);
+    expect(calls).toHaveLength(3);
+    expect(waits).toEqual([100, 300]);
+  });
+
+  it('does not retry a 4xx other than 429, nor a malformed answer', async () => {
+    const calls: string[] = [];
+    await expect(
+      compact(transcript(), flaky(new Map([['call_t1', [402]]]), [], calls), { preserveRecentMessages: 1, ...noWait }),
+    ).rejects.toThrow(/\(402\)/);
+    expect(calls).toHaveLength(1);
+    let asked = 0;
+    const malformed: JevAsker = { ask: async () => { asked++; return { answers: { nope: { noul: 1 } } }; } };
+    await expect(compact(transcript(), malformed, { preserveRecentMessages: 1, ...noWait })).rejects.toThrow(/Invalid Jev answer/);
+    expect(asked).toBe(1);
+  });
+
+  it('retries a JevTransportError but not any other thrown error', async () => {
+    let asked = 0;
+    const asker: JevAsker = {
+      async ask(_s, questions: JevQuestions) {
+        asked++;
+        if (asked === 1) throw new JevTransportError(new TypeError('fetch failed'));
+        return { answers: Object.fromEntries(Object.keys(questions).map((n) => [n, { noul: 0.9 }])) };
+      },
+    };
+    const output = await compact(transcript(), asker, { preserveRecentMessages: 1, ...noWait });
+    expect(asked).toBe(2);
+    expect(output.stats.retries).toBe(1);
+
+    let plain = 0;
+    const waits: number[] = [];
+    const broken: JevAsker = { ask: async () => { plain++; throw new Error('TYPESAFE_API_KEY is not configured'); } };
+    await expect(
+      compact(transcript(), broken, { preserveRecentMessages: 1, sleep: async (ms) => { waits.push(ms); } }),
+    ).rejects.toThrow(/not configured/);
+    expect(plain).toBe(1);
+    expect(waits).toEqual([]);
+  });
+
+  it('the HTTP client wraps a throwing fetch in JevTransportError', async () => {
+    const client = new JevClient({
+      apiKey: 'k',
+      fetch: (async () => { throw new TypeError('fetch failed'); }) as typeof fetch,
+    });
+    await expect(client.ask('s', {})).rejects.toBeInstanceOf(JevTransportError);
+  });
+
+  it('with onBatchFailure=keep, a dead batch is kept whole and the other batches still apply', async () => {
+    const messages = transcript();
+    const stateTokens = fitState(messages, collectToolCalls(messages, 1), { ...fit, goal: '', preserveRecentMessages: 1 }).tokens;
+    const batched = { preserveRecentMessages: 1, maxRequestTokens: stateTokens + 150, retries: 1, ...noWait };
+    const calls: string[] = [];
+    const dead = () => flaky(new Map([['call_t1', [503, 503, 503]]]), [], calls);
+
+    await expect(compact(messages, dead(), batched)).rejects.toThrow(/\(503\)/);
+
+    calls.length = 0;
+    const output = await compact(messages, dead(), { ...batched, onBatchFailure: 'keep' });
+    expect(output.stats.requests).toBeGreaterThan(1);
+    expect(output.stats.failedBatches).toBe(1);
+    expect(output.stats.retries).toBe(0);
+    const byId = new Map(output.decisions.map((d) => [d.id, d]));
+    expect(byId.get('t1')).toMatchObject({ action: 'keep', keepCall: 1, keepResult: 1 });
+    const others = output.decisions.filter((d) => d.id !== 't1' && d.reason !== 'pinned');
+    expect(others.length).toBeGreaterThan(0);
+    expect(others.every((d) => d.action === 'drop_call')).toBe(true);
+    // the dead batch was attempted 1 + retries times; the live ones once
+    expect(calls.filter((c) => c.includes('call_t1'))).toHaveLength(2);
   });
 });
 

@@ -105,6 +105,26 @@ export interface CompactOptions {
   maxRequestTokens?: number;
   /** Characters of a dropped tool result to retain. Default 300. */
   truncateHeadChars?: number;
+  /**
+   * Further attempts for one request after a transient failure (429, 5xx, or
+   * a `JevTransportError`). Default 2. Anything else (400, 401, 402, 404, a
+   * malformed body, a missing key) fails at once.
+   */
+  retries?: number;
+  /** Wait before the first retry, tripled on each further one. Default 500. */
+  retryDelayMs?: number;
+  /**
+   * What to do with a batch that still fails after its retries. `throw` (the
+   * default) rejects the whole compaction, so the caller can fall back; `keep`
+   * leaves every call of that batch untouched (keep call and result), applies
+   * the other batches' answers and counts it in `stats.failedBatches`.
+   */
+  onBatchFailure?: 'throw' | 'keep';
+  /**
+   * Waits between retries. Defaults to a timer on `globalThis.setTimeout`;
+   * a host without one (a Claude Code hooks module) passes its own clock.
+   */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 export interface ResolvedCompactOptions {
@@ -114,6 +134,10 @@ export interface ResolvedCompactOptions {
   maxStateTokens: number;
   maxRequestTokens: number;
   truncateHeadChars: number;
+  retries: number;
+  retryDelayMs: number;
+  onBatchFailure: 'throw' | 'keep';
+  sleep: (ms: number) => Promise<void>;
 }
 
 export interface CompactResult {
@@ -134,6 +158,10 @@ export interface CompactResult {
     /** Which fitting stage the state needed, '' when no request was made. */
     stateStage: string;
     requests: number;
+    /** Retries spent across all requests. */
+    retries: number;
+    /** Batches that failed after their retries and were kept whole (`onBatchFailure: 'keep'`). */
+    failedBatches: number;
     ms: number;
   };
 }

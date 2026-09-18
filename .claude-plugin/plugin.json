@@ -69,6 +69,16 @@
       "title": "Jev endpoint URL",
       "description": "URL the Jev requests are POSTed to. Point it at a gateway that proxies TypeSafe System One (an OpenRouter-style gateway needs the provider-prefixed model name).",
       "default": "https://api.typesafe.ai/v1/systemone"
+    },
+    "onBatchFailure": {
+      "type": "string",
+      "title": "On a failed request batch",
+      "description": "After its retries, a request batch that still fails either aborts the compaction so Claude Code's built-in summary runs (throw), or keeps every call of that batch whole while the other batches' answers apply (keep).",
+      "options": [
+        "throw",
+        "keep"
+      ],
+      "default": "throw"
     }
   }
 }
