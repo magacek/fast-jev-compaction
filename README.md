@@ -152,6 +152,10 @@ claude plugin install fast-jev-compaction@fast-jev-compaction
 
 The install prompts for the plugin options (API key, thresholds, `truncateHeadChars`,
 …); leave them at their defaults to use `TYPESAFE_API_KEY` from the environment.
+To go through a gateway that proxies System One, set `baseUrl` to its System One
+route and `model` to the name it routes (e.g. `typesafe/jev-latest`); `apiKeyEnv`
+names the settings `env` key holding the gateway's key. See
+[`hooks/README.md`](hooks/README.md#configuration).
 Restart Claude Code or run `/reload-plugins`. From then on `/compact` (and
 auto-compaction) goes through Jev: the toast reads
 `fast-jev-compaction: kept N/M messages, no summary (…)` when the pruned history

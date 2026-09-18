@@ -9,7 +9,7 @@ import type {
 } from 'claude-code';
 
 import { compact, reductionRatio, resolveOptions } from '../src/compact.js';
-import { buildJevRequest, DEFAULT_MODEL, parseJevResponse } from '../src/request.js';
+import { buildJevRequest, DEFAULT_MODEL, parseJevResponse, SYSTEM_ONE_URL } from '../src/request.js';
 import type {
   CompactOptions,
   CompactResult,
@@ -19,10 +19,14 @@ import type {
   ToolUse,
 } from '../src/types.js';
 
+const DEFAULT_KEY_ENV = 'TYPESAFE_API_KEY';
+
 const HOOK_DEFAULTS = {
   compactAtPercent: 60,
   minReductionRatio: 0.25,
   model: DEFAULT_MODEL,
+  baseUrl: SYSTEM_ONE_URL,
+  apiKeyEnv: DEFAULT_KEY_ENV,
 };
 
 export type HookFetchInit = {
@@ -45,6 +49,10 @@ export type HookConfig = CompactOptions & {
   compactAtPercent: number;
   minReductionRatio: number;
   model: string;
+  /** Endpoint the Jev requests are POSTed to; a gateway that proxies System One goes here. */
+  baseUrl: string;
+  /** Name of the environment variable (or `settings.env` key) that holds the key. */
+  apiKeyEnv: string;
 };
 
 function optionNumber(options: PluginOptions, key: string, fallback: number): number {
@@ -79,6 +87,8 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
       HOOK_DEFAULTS.minReductionRatio,
     ),
     model: optionString(options, 'model') ?? HOOK_DEFAULTS.model,
+    baseUrl: optionString(options, 'baseUrl') ?? HOOK_DEFAULTS.baseUrl,
+    apiKeyEnv: optionString(options, 'apiKeyEnv') ?? HOOK_DEFAULTS.apiKeyEnv,
   };
   const apiKey = optionString(options, 'apiKey');
   if (apiKey) config.apiKey = apiKey;
@@ -88,10 +98,15 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
 }
 
 /** A `JevAsker` over the engine's `$.http.fetch`. */
-export function jevAsker(fetchFn: HookFetch, apiKey: string, model: string): JevAsker {
+export function jevAsker(
+  fetchFn: HookFetch,
+  apiKey: string,
+  model: string,
+  baseUrl?: string,
+): JevAsker {
   return {
     async ask(state, questions) {
-      const request = buildJevRequest({ apiKey, model }, state, questions);
+      const request = buildJevRequest({ apiKey, model, baseUrl }, state, questions);
       const response = await fetchFn(request.url, {
         method: request.method,
         headers: request.headers,
@@ -167,8 +182,12 @@ export async function compactSession(
   config: HookConfig,
   fetchFn: HookFetch,
 ): Promise<SessionCompaction> {
-  if (!config.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
-  const result = await compact(messages, jevAsker(fetchFn, config.apiKey, config.model), config);
+  if (!config.apiKey) throw new Error(`${config.apiKeyEnv} is not configured`);
+  const result = await compact(
+    messages,
+    jevAsker(fetchFn, config.apiKey, config.model, config.baseUrl),
+    config,
+  );
   return { result, messages: toSessionMessages(messages, result.messages) };
 }
 
@@ -224,20 +243,28 @@ export function decisionLogLines(
   );
 }
 
-async function getApiKey(
+/**
+ * The key, in order: the sensitive `apiKey` plugin option, the process
+ * environment (only for the default `TYPESAFE_API_KEY`: the host lists a
+ * module's environment reads statically, so `$.env.get` takes a literal),
+ * then the variable named by `apiKeyEnv` under `env` in the user's settings.
+ */
+export async function getApiKey(
   $: {
     env: { get: (name: string) => Promise<string | undefined> };
     settings: { read: () => Promise<Readonly<Record<string, unknown>>> };
   },
-  config: HookConfig,
+  config: Pick<HookConfig, 'apiKey' | 'apiKeyEnv'>,
 ): Promise<string | undefined> {
   if (config.apiKey) return config.apiKey;
-  const fromEnv = await $.env.get('TYPESAFE_API_KEY');
-  if (fromEnv) return fromEnv;
+  if (config.apiKeyEnv === DEFAULT_KEY_ENV) {
+    const fromEnv = await $.env.get('TYPESAFE_API_KEY');
+    if (fromEnv) return fromEnv;
+  }
   const settings = await $.settings.read();
   const env = settings['env'];
   if (env && typeof env === 'object') {
-    const value = (env as Record<string, unknown>)['TYPESAFE_API_KEY'];
+    const value = (env as Record<string, unknown>)[config.apiKeyEnv];
     if (typeof value === 'string' && value) return value;
   }
   return undefined;

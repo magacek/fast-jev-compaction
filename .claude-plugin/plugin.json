@@ -6,9 +6,15 @@
   "userConfig": {
     "apiKey": {
       "type": "string",
-      "title": "TypeSafe API key",
-      "description": "TypeSafe API key. Leave unset to use TYPESAFE_API_KEY.",
+      "title": "Jev API key",
+      "description": "Bearer key for the Jev endpoint. Leave unset to read the variable named by apiKeyEnv.",
       "sensitive": true
+    },
+    "apiKeyEnv": {
+      "type": "string",
+      "title": "API key environment variable",
+      "description": "Environment variable (or settings.env key) that holds the Jev API key when apiKey is unset.",
+      "default": "TYPESAFE_API_KEY"
     },
     "keepThreshold": {
       "type": "number",
@@ -57,6 +63,12 @@
       "title": "Jev model",
       "description": "TypeSafe Jev model name.",
       "default": "jev-latest"
+    },
+    "baseUrl": {
+      "type": "string",
+      "title": "Jev endpoint URL",
+      "description": "URL the Jev requests are POSTed to. Point it at a gateway that proxies TypeSafe System One (an OpenRouter-style gateway needs the provider-prefixed model name).",
+      "default": "https://api.typesafe.ai/v1/systemone"
     }
   }
 }

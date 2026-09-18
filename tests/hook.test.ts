@@ -3,6 +3,7 @@ import {
   compactSession,
   decisionLog,
   decisionLogLines,
+  getApiKey,
   resolveHookConfig,
   summarize,
   toSessionMessages,
@@ -40,9 +41,10 @@ function transcript(): SessionMessage[] {
   ];
 }
 
-function jevFetch(answer: (name: string) => number, bodies: string[] = []) {
-  return async (_url: string, init?: { body?: string }) => {
+function jevFetch(answer: (name: string) => number, bodies: string[] = [], urls: string[] = []) {
+  return async (url: string, init?: { body?: string }) => {
     bodies.push(init?.body ?? '');
+    urls.push(url);
     const { questions } = JSON.parse(init?.body ?? '{}') as { questions: Record<string, unknown> };
     const answers = Object.fromEntries(
       Object.keys(questions).map((key) => [key, { type: 'noul', noul: answer(key) }]),
@@ -53,9 +55,24 @@ function jevFetch(answer: (name: string) => number, bodies: string[] = []) {
 
 describe('hook config', () => {
   it('reads userConfig values and falls back to defaults', () => {
-    expect(resolveHookConfig({})).toEqual({ compactAtPercent: 60, minReductionRatio: 0.25, model: 'jev-latest' });
+    expect(resolveHookConfig({})).toEqual({
+      compactAtPercent: 60,
+      minReductionRatio: 0.25,
+      model: 'jev-latest',
+      baseUrl: 'https://api.typesafe.ai/v1/systemone',
+      apiKeyEnv: 'TYPESAFE_API_KEY',
+    });
     expect(
-      resolveHookConfig({ apiKey: 'k', keepThreshold: 0.3, maxStateTokens: 1000, model: 'jev-x', goal: 'g', compactAtPercent: 'no' }),
+      resolveHookConfig({
+        apiKey: 'k',
+        keepThreshold: 0.3,
+        maxStateTokens: 1000,
+        model: 'jev-x',
+        goal: 'g',
+        compactAtPercent: 'no',
+        baseUrl: 'https://gateway.example/v1/systemone',
+        apiKeyEnv: 'GATEWAY_KEY',
+      }),
     ).toEqual({
       apiKey: 'k',
       keepThreshold: 0.3,
@@ -64,7 +81,43 @@ describe('hook config', () => {
       goal: 'g',
       compactAtPercent: 60,
       minReductionRatio: 0.25,
+      baseUrl: 'https://gateway.example/v1/systemone',
+      apiKeyEnv: 'GATEWAY_KEY',
     });
+  });
+
+  it('ignores an empty baseUrl or apiKeyEnv and keeps the defaults', () => {
+    expect(resolveHookConfig({ baseUrl: '', apiKeyEnv: '' })).toMatchObject({
+      baseUrl: 'https://api.typesafe.ai/v1/systemone',
+      apiKeyEnv: 'TYPESAFE_API_KEY',
+    });
+  });
+});
+
+describe('getApiKey', () => {
+  function host(env: Record<string, string>, settingsEnv: Record<string, unknown> = {}) {
+    return {
+      env: { get: async (name: string) => env[name] },
+      settings: { read: async () => ({ env: settingsEnv })},
+    };
+  }
+
+  it('reads the default TYPESAFE_API_KEY from the process, then from settings.env', async () => {
+    const config = { apiKeyEnv: 'TYPESAFE_API_KEY' };
+    await expect(getApiKey(host({ TYPESAFE_API_KEY: 'from-env' }, { TYPESAFE_API_KEY: 'x' }), config)).resolves.toBe('from-env');
+    await expect(getApiKey(host({}, { TYPESAFE_API_KEY: 'from-settings' }), config)).resolves.toBe('from-settings');
+    await expect(getApiKey(host({}, {}), config)).resolves.toBeUndefined();
+  });
+
+  it('reads a custom apiKeyEnv from settings.env only, never the default variable', async () => {
+    const config = { apiKeyEnv: 'GATEWAY_KEY' };
+    await expect(getApiKey(host({ TYPESAFE_API_KEY: 'wrong' }, { GATEWAY_KEY: 'from-settings' }), config)).resolves.toBe('from-settings');
+    await expect(getApiKey(host({ TYPESAFE_API_KEY: 'wrong' }, { TYPESAFE_API_KEY: 'wrong' }), config)).resolves.toBeUndefined();
+    await expect(getApiKey(host({ GATEWAY_KEY: 'process-only' }, {}), config)).resolves.toBeUndefined();
+  });
+
+  it('prefers the sensitive apiKey option over any variable', async () => {
+    await expect(getApiKey(host({ GATEWAY_KEY: 'from-env' }), { apiKey: 'opt', apiKeyEnv: 'GATEWAY_KEY' })).resolves.toBe('opt');
   });
 });
 
@@ -112,13 +165,15 @@ describe('session message mapping', () => {
 describe('compactSession', () => {
   it('runs the library over the engine fetch and reports the outcome', async () => {
     const bodies: string[] = [];
+    const urls: string[] = [];
     const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k', model: 'jev-x' };
     const { result: output, messages } = await compactSession(
       transcript(),
       config,
-      jevFetch((name) => (name === 'call_t2' || name === 'result_t2' ? 0.9 : 0.1), bodies),
+      jevFetch((name) => (name === 'call_t2' || name === 'result_t2' ? 0.9 : 0.1), bodies, urls),
     );
     expect(bodies).toHaveLength(1);
+    expect(urls).toEqual(['https://api.typesafe.ai/v1/systemone']);
     expect(JSON.parse(bodies[0]!).model).toBe('jev-x');
     expect(output.decisions.map((d) => d.action)).toEqual(['drop_call', 'keep']);
     expect(messages.map((m) => m.handle)).toEqual(['h-0', 'h-tool-2', 'r-tool-2', 'h-5', 'h-6']);
@@ -139,9 +194,28 @@ describe('compactSession', () => {
     expect(decisionLogLines({ ...output, decisions: [] })).toEqual(['decisions: (none)']);
   });
 
+  it('posts to the configured baseUrl with the configured model', async () => {
+    const urls: string[] = [];
+    const bodies: string[] = [];
+    const config = {
+      ...resolveHookConfig({
+        preserveRecentMessages: 1,
+        baseUrl: 'https://gateway.example/v1/systemone',
+        model: 'typesafe/jev-latest',
+      }),
+      apiKey: 'k',
+    };
+    await compactSession(transcript(), config, jevFetch(() => 0.9, bodies, urls));
+    expect(urls).toEqual(['https://gateway.example/v1/systemone']);
+    expect(JSON.parse(bodies[0]!).model).toBe('typesafe/jev-latest');
+  });
+
   it('throws on a missing key and on failed requests so the hook falls back', async () => {
     const config = resolveHookConfig({ preserveRecentMessages: 1 });
     await expect(compactSession(transcript(), config, jevFetch(() => 0))).rejects.toThrow(/TYPESAFE_API_KEY/);
+    await expect(
+      compactSession(transcript(), resolveHookConfig({ preserveRecentMessages: 1, apiKeyEnv: 'GATEWAY_KEY' }), jevFetch(() => 0)),
+    ).rejects.toThrow(/GATEWAY_KEY is not configured/);
     await expect(
       compactSession(transcript(), { ...config, apiKey: 'k' }, async () => ({ status: 500, ok: false, text: 'x' })),
     ).rejects.toThrow(/500/);

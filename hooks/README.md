@@ -56,13 +56,24 @@ The plugin declares these `userConfig` values in
 | `maxRequestTokens` | `30000` |
 | `truncateHeadChars` | `300` |
 | `model` | `jev-latest` |
+| `baseUrl` | `https://api.typesafe.ai/v1/systemone` |
+| `apiKeyEnv` | `TYPESAFE_API_KEY` |
 
 The TypeSafe key can be supplied as the sensitive `apiKey` plugin option or
 through `TYPESAFE_API_KEY`. The environment variable is the recommended
 development setup.
 
-Every option except `apiKey`, `compactAtPercent`, `minReductionRatio` and
-`model` is passed straight to the library; see the root README for what they
+To send the requests through a gateway that proxies System One (an
+OpenRouter-style gateway such as an internal LLM proxy), set `baseUrl` to the
+gateway's System One route, `model` to the name the gateway routes (usually
+provider-prefixed, e.g. `typesafe/jev-latest`) and, if the gateway has its own
+key, either the `apiKey` option or `apiKeyEnv` naming the variable that holds
+it. The host lists a module's environment reads statically, so a custom
+`apiKeyEnv` is read from `env` in the user's settings only; the process
+environment is consulted for `TYPESAFE_API_KEY` alone.
+
+Every option except `apiKey`, `apiKeyEnv`, `baseUrl`, `compactAtPercent`,
+`minReductionRatio` and `model` is passed straight to the library; see the root README for what they
 do. The `session.compact` hook runs the Jev requests concurrently. If Jev fails,
 the response is malformed, the key is unavailable, the history cannot be
 fitted into the state budget, or the estimated reduction is below
