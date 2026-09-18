@@ -68,6 +68,15 @@ export class JevRequestError extends JevError {
 
 type Thrown = { name?: unknown; code?: unknown; message?: unknown };
 
+function isObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object';
+}
+
+/** The message of whatever was thrown, for a human. */
+function describe(thrown: unknown): string {
+  return thrown instanceof Error ? thrown.message : String(thrown);
+}
+
 /** The caller gave up: an `AbortError` from a signal. */
 function abortedByCaller(cause: Thrown): boolean {
   return cause.name === 'AbortError';
@@ -76,7 +85,7 @@ function abortedByCaller(cause: Thrown): boolean {
 /** The URL itself is wrong: a configuration error, not the network. */
 function unparsableUrl(cause: Thrown): boolean {
   const invalidUrlCode = cause.code === 'ERR_INVALID_URL';
-  const invalidUrlMessage = /invalid url|failed to parse url/i.test(String(cause.message ?? ''));
+  const invalidUrlMessage = /invalid url|failed to parse url/i.test(describe(cause));
   return invalidUrlCode || invalidUrlMessage;
 }
 
@@ -88,13 +97,13 @@ function unparsableUrl(cause: Thrown): boolean {
 export class JevTransportError extends JevError {
   readonly cause: unknown;
   constructor(cause: unknown) {
-    super(`Jev transport failed: ${cause instanceof Error ? cause.message : String(cause)}`, 'JevTransportError');
+    super(`Jev transport failed: ${describe(cause)}`, 'JevTransportError');
     this.cause = cause;
   }
   /** True unless the caller aborted or the URL cannot be parsed. */
   override get retryable(): boolean {
-    if (!this.cause || typeof this.cause !== 'object') return true;
-    const cause = this.cause as Thrown;
+    if (!isObject(this.cause)) return true;
+    const cause: Thrown = this.cause;
     return !abortedByCaller(cause) && !unparsableUrl(cause);
   }
 }
@@ -128,14 +137,12 @@ export function parseJevResponse(
 
 /** Whether a parsed body is an object carrying an `answers` object. */
 function hasAnswers(parsed: unknown): parsed is JevResponse {
-  const isObject = (value: unknown): value is Record<string, unknown> =>
-    value !== null && typeof value === 'object';
   return isObject(parsed) && isObject(parsed['answers']);
 }
 
 /** Whether `answer` carries a finite `noul` probability. */
 export function hasNoul(answer: JevAnswer | undefined): answer is NoulAnswer {
-  const noul = answer && 'noul' in answer ? answer.noul : undefined;
+  const noul = (answer as Partial<NoulAnswer> | undefined)?.noul;
   return Number.isFinite(noul);
 }
 

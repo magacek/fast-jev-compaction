@@ -11,6 +11,7 @@ import type {
   JevQuestions,
   Message,
   ResolvedCompactOptions,
+  Sleep,
   ToolCall,
   ToolUse,
 } from './types.js';
@@ -45,29 +46,29 @@ function finite(value: number | undefined, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 }
 
+/** A finite value no smaller than `min`, or the fallback. */
+function atLeast(min: number, value: number | undefined, fallback: number): number {
+  return Math.max(min, finite(value, fallback));
+}
+
+/** A finite whole number no smaller than `min`, or the fallback. */
+function wholeAtLeast(min: number, value: number | undefined, fallback: number): number {
+  return Math.max(min, Math.floor(finite(value, fallback)));
+}
+
 export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOptions {
+  const d = DEFAULT_OPTIONS;
   return {
-    goal: options.goal ?? DEFAULT_OPTIONS.goal,
-    keepThreshold: finite(options.keepThreshold, DEFAULT_OPTIONS.keepThreshold),
-    preserveRecentMessages: Math.max(
-      0,
-      Math.floor(
-        finite(options.preserveRecentMessages, DEFAULT_OPTIONS.preserveRecentMessages),
-      ),
-    ),
-    maxStateTokens: Math.max(1, finite(options.maxStateTokens, DEFAULT_OPTIONS.maxStateTokens)),
-    maxRequestTokens: Math.max(
-      1,
-      finite(options.maxRequestTokens, DEFAULT_OPTIONS.maxRequestTokens),
-    ),
-    truncateHeadChars: Math.max(
-      0,
-      Math.floor(finite(options.truncateHeadChars, DEFAULT_OPTIONS.truncateHeadChars)),
-    ),
-    retries: Math.max(0, Math.floor(finite(options.retries, DEFAULT_OPTIONS.retries))),
-    retryDelayMs: Math.max(0, finite(options.retryDelayMs, DEFAULT_OPTIONS.retryDelayMs)),
-    onBatchFailure: options.onBatchFailure === 'keep' ? 'keep' : DEFAULT_OPTIONS.onBatchFailure,
-    sleep: options.sleep ?? DEFAULT_OPTIONS.sleep,
+    goal: options.goal ?? d.goal,
+    keepThreshold: finite(options.keepThreshold, d.keepThreshold),
+    preserveRecentMessages: wholeAtLeast(0, options.preserveRecentMessages, d.preserveRecentMessages),
+    maxStateTokens: atLeast(1, options.maxStateTokens, d.maxStateTokens),
+    maxRequestTokens: atLeast(1, options.maxRequestTokens, d.maxRequestTokens),
+    truncateHeadChars: wholeAtLeast(0, options.truncateHeadChars, d.truncateHeadChars),
+    retries: wholeAtLeast(0, options.retries, d.retries),
+    retryDelayMs: atLeast(0, options.retryDelayMs, d.retryDelayMs),
+    onBatchFailure: options.onBatchFailure === 'keep' ? 'keep' : d.onBatchFailure,
+    sleep: options.sleep ?? d.sleep,
   };
 }
 
@@ -151,6 +152,30 @@ type Asked =
   | { ok: true; answers: Record<string, JevAnswer>; retries: number }
   | { ok: false; error: unknown; retries: number };
 
+/** One attempt: the answers, or whatever the asker threw. */
+async function attemptAsk(
+  asker: JevAsker,
+  state: CompactionState,
+  questions: JevQuestions,
+): Promise<{ answers: Record<string, JevAnswer> } | { error: unknown }> {
+  try {
+    const { answers } = await asker.ask(state, questions);
+    return { answers };
+  } catch (error) {
+    return { error };
+  }
+}
+
+/** Waits `ms`; resolves with the rejection when the wait is interrupted. */
+async function waitOrInterrupt(sleep: Sleep, ms: number): Promise<unknown> {
+  try {
+    await sleep(ms);
+    return undefined;
+  } catch (interrupted) {
+    return interrupted;
+  }
+}
+
 /** One request with its retries; never throws, the retries spent are reported either way. */
 async function askWithRetries(
   asker: JevAsker,
@@ -160,20 +185,14 @@ async function askWithRetries(
 ): Promise<Asked> {
   let delay = options.retryDelayMs;
   for (let attempt = 0; ; attempt++) {
-    try {
-      const { answers } = await asker.ask(state, questions);
-      return { ok: true, answers, retries: attempt };
-    } catch (error) {
-      const exhausted = attempt >= options.retries;
-      const giveUp = exhausted || !transient(error);
-      if (giveUp) return { ok: false, error, retries: attempt };
-      try {
-        await options.sleep(delay);
-      } catch (interrupted) {
-        return { ok: false, error: interrupted, retries: attempt };
-      }
-      delay *= 3;
-    }
+    const attempted = await attemptAsk(asker, state, questions);
+    if ('answers' in attempted) return { ok: true, answers: attempted.answers, retries: attempt };
+    const exhausted = attempt >= options.retries;
+    const giveUp = exhausted || !transient(attempted.error);
+    if (giveUp) return { ok: false, error: attempted.error, retries: attempt };
+    const interrupted = await waitOrInterrupt(options.sleep, delay);
+    if (interrupted !== undefined) return { ok: false, error: interrupted, retries: attempt };
+    delay *= 3;
   }
 }
 
