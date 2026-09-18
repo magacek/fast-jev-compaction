@@ -1,4 +1,4 @@
-import { JevRequestError, JevResponseError, JevTransportError, noulAnswer } from './request.js';
+import { JevError, JevResponseError, hasNoul } from './request.js';
 import { collectToolCalls, estimateTokens, fitState } from './state.js';
 import type {
   CallAnswer,
@@ -137,9 +137,7 @@ export function decideCall(
  * malformed body, any other 4xx, or an unrecognised error is not.
  */
 function transient(error: unknown): boolean {
-  if (error instanceof JevRequestError) return error.retryable;
-  if (error instanceof JevTransportError) return error.retryable;
-  return false;
+  return error instanceof JevError && error.retryable;
 }
 
 /** What `onBatchFailure: 'keep'` may keep: a hiccup that outlived its retries, or a bad answer. */
@@ -164,7 +162,8 @@ async function askWithRetries(
       const { answers } = await asker.ask(state, questions);
       return { ok: true, answers, retries: attempt };
     } catch (error) {
-      if (attempt >= options.retries || !transient(error)) return { ok: false, error, retries: attempt };
+      const exhausted = attempt >= options.retries;
+      if (exhausted || !transient(error)) return { ok: false, error, retries: attempt };
       try {
         await options.sleep(delay);
       } catch (interrupted) {
@@ -173,6 +172,23 @@ async function askWithRetries(
       delay *= 3;
     }
   }
+}
+
+/** One call's two answers, or the names of the ones that are missing or malformed. */
+function readCallAnswer(
+  answers: Record<string, JevAnswer>,
+  call: ToolCall,
+): { answer: CallAnswer } | { invalid: string[] } {
+  const callName = `call_${call.id}`;
+  const resultName = `result_${call.id}`;
+  const invalid = [callName, resultName].filter((name) => !hasNoul(answers[name]));
+  if (invalid.length > 0) return { invalid };
+  return {
+    answer: {
+      keepCall: (answers[callName] as { noul: number }).noul,
+      keepResult: (answers[resultName] as { noul: number }).noul,
+    },
+  };
 }
 
 type Batched =
@@ -195,21 +211,9 @@ async function askBatch(
   const answers = new Map<string, CallAnswer>();
   const invalid: string[] = [];
   for (const call of batch) {
-    const pair: Partial<CallAnswer> = {};
-    for (const [field, name] of [
-      ['keepCall', `call_${call.id}`],
-      ['keepResult', `result_${call.id}`],
-    ] as const) {
-      try {
-        pair[field] = noulAnswer(asked.answers, name);
-      } catch (error) {
-        if (!(error instanceof JevResponseError)) throw error;
-        invalid.push(name);
-      }
-    }
-    if (pair.keepCall !== undefined && pair.keepResult !== undefined) {
-      answers.set(call.id, { keepCall: pair.keepCall, keepResult: pair.keepResult });
-    }
+    const read = readCallAnswer(asked.answers, call);
+    if ('answer' in read) answers.set(call.id, read.answer);
+    else invalid.push(...read.invalid);
   }
   if (invalid.length > 0) {
     return {
@@ -219,6 +223,41 @@ async function askBatch(
     };
   }
   return { ok: true, answers, retries: asked.retries };
+}
+
+/**
+ * Asks every batch (askBatch never rejects) and merges what came back. Under
+ * `keep` a batch that outlived its retries or came back malformed is counted
+ * and its calls are left unanswered (so kept); anything else, and every
+ * failure under `throw`, rejects with the actionable error first.
+ */
+async function askBatches(
+  asker: JevAsker,
+  state: CompactionState,
+  batches: readonly ToolCall[][],
+  options: ResolvedCompactOptions,
+): Promise<{ answers: Map<string, CallAnswer>; retries: number; failedBatches: number }> {
+  const outcomes = await Promise.all(
+    batches.map((batch) => askBatch(asker, state, batch, options)),
+  );
+  const answers = new Map<string, CallAnswer>();
+  const failures: unknown[] = [];
+  let retries = 0;
+  let failedBatches = 0;
+  for (const outcome of outcomes) {
+    retries += outcome.retries;
+    if (outcome.ok) {
+      for (const [id, answer] of outcome.answers) answers.set(id, answer);
+      continue;
+    }
+    const salvageable = options.onBatchFailure === 'keep' && keepable(outcome.error);
+    if (salvageable) failedBatches++;
+    else failures.push(outcome.error);
+  }
+  if (failures.length > 0) {
+    throw failures.find((error) => !transient(error)) ?? failures[0];
+  }
+  return { answers, retries, failedBatches };
 }
 
 function truncatedResultText(text: string, isError: boolean, headChars: number): string {
@@ -356,35 +395,14 @@ export async function compact(
 
   let fitted: { tokens: number; stage: string } = { tokens: 0, stage: '' };
   let batches: ToolCall[][] = [];
-  const answers = new Map<string, CallAnswer>();
-  let retries = 0;
-  let failedBatches = 0;
+  let asked = { answers: new Map<string, CallAnswer>(), retries: 0, failedBatches: 0 };
   if (candidates.length > 0) {
     const state = fitState(messages, calls, resolved);
     fitted = state;
     batches = batchCalls(candidates, state.tokens, resolved);
-    // Every batch runs to completion before any failure is acted on (askBatch
-    // never rejects), so under `keep` the answers already paid for survive a
-    // sibling's failure. Under `throw` the compaction still fails as a whole.
-    const outcomes = await Promise.all(
-      batches.map((batch) => askBatch(asker, state.state, batch, resolved)),
-    );
-    const failures: unknown[] = [];
-    for (const outcome of outcomes) {
-      retries += outcome.retries;
-      if (outcome.ok) {
-        for (const [id, answer] of outcome.answers) answers.set(id, answer);
-      } else if (resolved.onBatchFailure === 'keep' && keepable(outcome.error)) {
-        failedBatches++;
-      } else {
-        failures.push(outcome.error);
-      }
-    }
-    if (failures.length > 0) {
-      // The actionable error first: a bad key or a malformed body over a hiccup.
-      throw failures.find((error) => !transient(error)) ?? failures[0];
-    }
+    asked = await askBatches(asker, state.state, batches, resolved);
   }
+  const { answers, retries, failedBatches } = asked;
 
   const decisions = calls.map((call) =>
     decideCall(call, answers.get(call.id) ?? { keepCall: 1, keepResult: 1 }, resolved),

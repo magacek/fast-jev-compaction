@@ -122,26 +122,22 @@ export interface CompactOptions {
    * malformed answer; a 4xx other than 429, an abort or an unrecognised error
    * is the request's fault and throws in both modes.
    */
-  onBatchFailure?: 'throw' | 'keep';
+  onBatchFailure?: BatchFailurePolicy;
   /**
    * Waits between retries. Defaults to a timer on `globalThis.setTimeout`;
    * a host without one (a Claude Code hooks module) passes its own clock.
    */
-  sleep?: (ms: number) => Promise<void>;
+  sleep?: Sleep;
 }
 
-export interface ResolvedCompactOptions {
-  goal: string;
-  keepThreshold: number;
-  preserveRecentMessages: number;
-  maxStateTokens: number;
-  maxRequestTokens: number;
-  truncateHeadChars: number;
-  retries: number;
-  retryDelayMs: number;
-  onBatchFailure: 'throw' | 'keep';
-  sleep: (ms: number) => Promise<void>;
-}
+/** `throw` rejects the compaction on a failed batch; `keep` leaves that batch's calls whole. */
+export type BatchFailurePolicy = 'throw' | 'keep';
+
+/** Resolves once `ms` milliseconds have passed. */
+export type Sleep = (ms: number) => Promise<void>;
+
+/** `CompactOptions` with every default filled in. */
+export type ResolvedCompactOptions = Required<CompactOptions>;
 
 export interface CompactResult {
   /** The compacted transcript; untouched messages are the input objects. */
