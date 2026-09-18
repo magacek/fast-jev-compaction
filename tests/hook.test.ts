@@ -4,6 +4,7 @@ import {
   decisionLog,
   decisionLogLines,
   getApiKey,
+  register,
   resolveHookConfig,
   summarize,
   toSessionMessages,
@@ -219,5 +220,64 @@ describe('compactSession', () => {
     await expect(
       compactSession(transcript(), { ...config, apiKey: 'k' }, async () => ({ status: 500, ok: false, text: 'x' })),
     ).rejects.toThrow(/500/);
+  });
+});
+
+describe('register', () => {
+  type Hook = (...args: any[]) => Promise<unknown>;
+  function registered(options: Record<string, unknown> = {}) {
+    const hooks: Record<string, Hook> = {};
+    (register as any)((event: string, hook: Hook) => { hooks[event] = hook; }, { apiKey: 'k', ...options });
+    return hooks;
+  }
+  function engine(fetchFn: ReturnType<typeof jevFetch>) {
+    const logs: string[] = [];
+    const toasts: string[] = [];
+    const compactCalls: unknown[] = [];
+    const $ = {
+      env: { get: async () => undefined },
+      settings: { read: async () => ({}) },
+      http: {
+        fetch: async (url: string, init?: { body?: string }) => {
+          const r = await fetchFn(url, init);
+          return { ...r, headers: {} };
+        },
+      },
+      ui: { log: (t: string) => logs.push(t), toast: (t: string) => toasts.push(t) },
+      session: {
+        usage: async () => ({ context: { percent: 100 } }),
+        compact: async (...args: unknown[]) => { compactCalls.push(args); return { messages: [] }; },
+      },
+    };
+    return { $, logs, toasts, compactCalls };
+  }
+
+  it('toasts a manual compaction but only logs a precompute', async () => {
+    const hooks = registered({ preserveRecentMessages: 1, minReductionRatio: 0 });
+    const next = async () => ({ messages: [] });
+    const manual = engine(jevFetch(() => 0.1));
+    const out = (await hooks['session.compact']!(manual.$, { trigger: 'manual', messages: transcript() }, next)) as { messages: unknown[] };
+    expect(out.messages).toHaveLength(3);
+    expect(manual.toasts).toHaveLength(1);
+    expect(manual.toasts[0]).toMatch(/^kept 3\/7 messages/);
+
+    const pre = engine(jevFetch(() => 0.1));
+    const outPre = (await hooks['session.compact']!(pre.$, { trigger: 'precompute', messages: transcript() }, next)) as { messages: unknown[] };
+    expect(outPre.messages).toHaveLength(3);
+    expect(pre.toasts).toEqual([]);
+    expect(pre.logs.some((l) => l.startsWith('kept 3/7 messages'))).toBe(true);
+  });
+
+  it('does not request compaction from a subagent turn', async () => {
+    const hooks = registered({ compactAtPercent: 50 });
+    let nextCalls = 0;
+    const next = async (e: unknown) => { nextCalls++; return e; };
+    const sub = engine(jevFetch(() => 0.1));
+    await hooks['turn.complete']!(sub.$, { agentId: 'agent-1', turnId: 't', isAborted: false }, next);
+    expect(sub.compactCalls).toEqual([]);
+    const main = engine(jevFetch(() => 0.1));
+    await hooks['turn.complete']!(main.$, { turnId: 't', isAborted: false }, next);
+    expect(main.compactCalls).toHaveLength(1);
+    expect(nextCalls).toBe(2);
   });
 });

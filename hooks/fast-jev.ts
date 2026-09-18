@@ -270,6 +270,11 @@ export async function getApiKey(
   return undefined;
 }
 
+/**
+ * Logs always; toasts unless the compaction is a `precompute`, whose result
+ * the engine only keeps for a compaction that may come later, so a toast
+ * saying messages were replaced would be premature.
+ */
 function notify(
   $: {
     ui: {
@@ -278,9 +283,10 @@ function notify(
     };
   },
   text: string,
+  quiet = false,
 ): void {
   $.ui.log(text);
-  $.ui.toast(text, { timeoutMs: 15_000 });
+  if (!quiet) $.ui.toast(text, { timeoutMs: 15_000 });
 }
 
 export const register: Register = (on: On, options: PluginOptions) => {
@@ -288,6 +294,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
   let compacting = false;
 
   on('session.compact', async ($, event, next) => {
+    const quiet = event.trigger === 'precompute';
     try {
       const config = { ...configured, apiKey: await getApiKey($, configured) };
       const { result, messages } = await compactSession(event.messages, config, async (url, init) => {
@@ -299,25 +306,30 @@ export const register: Register = (on: On, options: PluginOptions) => {
         notify(
           $,
           `fallback to built-in summary (below ${percent(config.minReductionRatio)} minimum: ${summarize(result)})`,
+          quiet,
         );
         return next(event);
       }
       notify(
         $,
         `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result)})`,
+        quiet,
       );
       return { messages };
     } catch (error) {
       notify(
         $,
         `fallback to built-in summary (${error instanceof Error ? error.message : String(error)})`,
+        quiet,
       );
       return next(event);
     }
   });
 
   on('turn.complete', async ($, event: TurnCompleteInput, next) => {
-    if (compacting) return next(event);
+    // A subagent's turn is not the main conversation; compacting it from here
+    // would target the main loop while its turn still runs.
+    if (event.agentId || compacting) return next(event);
     try {
       const { context } = await $.session.usage();
       if ((context.percent ?? 0) < configured.compactAtPercent) return next(event);
